@@ -1,0 +1,34 @@
+# LPATH tells the linker where to find libraries
+LPATH = -L/usr/src/Mesa/include -L/usr/X11R6/lib -L/usr/lib -L/usr/lib/mesa
+
+# IPATH tells the compiler where to look for include files.
+IPATH = -I/usr/local/include -I/usr/src/Mesa/include
+
+# GLLIBS are the GLUT and OpenGL (or Mesa) libraries needed by the linker.
+GLLIBS = -lglut -lGLU -lGL
+
+# XLIBS are the X libraries needed by the linker because GLUT and OpenGL
+#       call X routines.
+XLIBS = -lX11 -lXext -lXi -lXmu
+
+# MISCLIBS are miscellaneous libs that are needed by the linker.
+# -lm denotes the math library.
+
+RM = rm -f
+
+LIBS = $(LPATH) $(GLLIBS) $(XLIBS) $(MISCLIBS)
+
+CC = g++
+# -Wall	tells the compiler to print warnings about pretty much everything.
+CFLAGS = -Wall
+
+all : isosurface_vertices.srl
+
+%.srl : %.o
+	$(CC) $(CFLAGS) -o $@ $< $(LIBS)
+
+# The default way to convert .c files into .o files.
+%.o : %.cpp		; $(CC) -c $(CFLAGS) -o $@ $(IPATH) $<
+
+clean:
+	$(RM) *.o *.srl *~
