@@ -1,6 +1,3 @@
-/*
-nvidia-settings --load-config-only --assign="SyncToVBlank=0"
-*/
 
 #include <iostream>
 #include <string>
@@ -11,7 +8,9 @@ nvidia-settings --load-config-only --assign="SyncToVBlank=0"
 #include <string.h>
 #include <stdlib.h>
 #include <math.h>
+#ifdef SSE
 #include <x86intrin.h>
+#endif
 
 pthread_mutex_t step_mutex;
 //pthread_mutex_t sync_mutex;
