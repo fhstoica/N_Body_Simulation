@@ -1,3 +1,7 @@
+/*
+nvidia-settings --load-config-only --assign="SyncToVBlank=0"
+*/
+
 #include <iostream>
 #include <string>
 #include <fstream>
@@ -7,20 +11,23 @@
 #include <string.h>
 #include <stdlib.h>
 #include <math.h>
- 
+#include <x86intrin.h>
+
 pthread_mutex_t step_mutex;
 //pthread_mutex_t sync_mutex;
 pthread_barrier_t barr;
 
 const int N          = 16;
 const unsigned int MaxThreads = 4;
-const long int SimSteps  = 1000000;;
+const long int SimSteps  = 10000000;
 const int reduction  = 50;
 const int dim        = 3;
-double dt            = 1.0e-5;
-double init_dt       = dt;
-double accum_time    = 0;
-double max_ratio     = 0; 
+float dt            = 1.0e-5;
+float init_dt       = dt;
+float dt_square     = 0.0f;
+float accum_time    = 0;
+float max_ratio     = 0; 
+const float hf      = 0.5;
 unsigned int interframe_counter = 0;
 
 unsigned int lock_step;
@@ -31,25 +38,25 @@ typedef struct{
 } T_Data;
 
 typedef struct{
-  double pos[N][dim];
-  double vel[N][dim];
-  double acc[N][dim];
-  double F[N][dim];
+  float pos[N][dim];
+  float vel[N][dim];
+  float acc[N][dim];
+  float F[N][dim];
 } Coords;
 
 typedef struct{
-  double pos[N][dim];
-  double vel[N][dim];
+  float pos[N][dim];
+  float vel[N][dim];
 } PosVelOnly;
 
 typedef struct{
-  double KE;
-  double PE;
-  double tot_E;
-  double dtt;
-  double KE_A[MaxThreads];
-  double PE_A[MaxThreads];
-  double tot_E_A[MaxThreads];
+  float KE;
+  float PE;
+  float tot_E;
+  float dtt;
+  float KE_A[MaxThreads];
+  float PE_A[MaxThreads];
+  float tot_E_A[MaxThreads];
 } EnergyStr;
 
 
@@ -61,8 +68,8 @@ std::vector<PosVelOnly> PosVelOnlyVec;
 void MoveToCM(Coords& currPos){
   /*Make sure that the position and velocity of the center of mass of the cluster are set to zero, 
    otherwise it will be very difficult to visualize the cluster as it is zipping along. */
-  double posCM[dim];
-  double velCM[dim];
+  float posCM[dim];
+  float velCM[dim];
   for(int i = 0; i < dim; ++i){
     posCM[i] = 0;
     velCM[i] = 0;
@@ -84,11 +91,15 @@ void MoveToCM(Coords& currPos){
 }
 
 void adaptive_step(Coords& currPos){
-  double abs_vel[N];
-  double min_dist[N];
-  double tmp_dist, max_dist_vel_ratio, min_dist_vel_ratio;
+  float abs_vel[N];
+  float min_dist[N];
+  float tmp_dist, max_dist_vel_ratio, min_dist_vel_ratio;
   int min_index;
-  
+
+#ifdef SSE
+  /************************** SSE code ***************************/
+  float distance_buffer[4] __attribute__ ((aligned (16)));
+#endif
 
   for(int j = 0; j < N; ++j){
     abs_vel[j] = 0;  
@@ -98,10 +109,31 @@ void adaptive_step(Coords& currPos){
     abs_vel[j] = sqrt(abs_vel[j]);
 
     min_dist[j] = 0;    
+    
+#ifdef SSE
+    /************************** SSE code ***************************/
+    distance_buffer[0] = currPos.pos[j][0] - currPos.pos[(j+1)%N][0];
+    distance_buffer[1] = currPos.pos[j][1] - currPos.pos[(j+1)%N][1];
+    distance_buffer[2] = currPos.pos[j][2] - currPos.pos[(j+1)%N][2];
+    distance_buffer[3] = 0.0f;
+    
+    __m128 v_1 = _mm_load_ps(distance_buffer);
+    
+    __m128 prod = _mm_mul_ps(v_1, v_1);
+    //Now sum the results
+    prod = _mm_hadd_ps(prod, prod);
+    prod = _mm_hadd_ps(prod, prod);
+    __m128 sqrt_dist = _mm_sqrt_ss(prod);
+    _mm_store_ps(distance_buffer, sqrt_dist);
+    min_dist[j] = distance_buffer[0];
+#else
+    /************************** Non-SSE Code ***********************/
     for(int k = 0; k < dim; ++k){
       min_dist[j] += pow(currPos.pos[j][k] - currPos.pos[(j+1)%N][k], 2); //Take the distance to the next particle circularly
     }
     min_dist[j] = sqrt(min_dist[j]);
+    /***************************************************************/
+#endif
 
     for(int i = 0; i < N; ++i){
       if(i != j){
@@ -141,10 +173,20 @@ void adaptive_step(Coords& currPos){
 
 void evolve_Verlet1(T_Data& currThread){
   /************** Compute x(t + \delta t) and v(t + \delta t/2) ****************/
-  double dist = 0;
+  float dist = 0;
   int lLim   = static_cast<int>((N*currThread.t_num)/MaxThreads);
   int uLim   = static_cast<int>((N*(currThread.t_num+1))/MaxThreads);
-  
+
+  dt_square  = dt*dt;
+
+#ifdef SSE
+  /************************** SSE code ***************************/
+  float distance_buffer[4] __attribute__ ((aligned (16)));
+  float position_buffer[4] __attribute__ ((aligned (16)));
+  float velocity_buffer[4] __attribute__ ((aligned (16)));
+  float accel_buffer[4]    __attribute__ ((aligned (16)));
+#endif
+
   for(int i = lLim; i < uLim; ++i){//Process only one piece of the data allocated to the thread
     dist = 0;
     for(int k = 0; k < dim; ++k){
@@ -153,28 +195,108 @@ void evolve_Verlet1(T_Data& currThread){
     for(int j = 0; j < N; ++j){//Need to consider interaction with all other particles
       if(i != j){
 	dist = 0;
+
+#ifdef SSE
+	/************************** SSE code ***************************/
+	//unroll loop
+	distance_buffer[0] = T1->pos[i][0] - T1->pos[j][0];
+	distance_buffer[1] = T1->pos[i][1] - T1->pos[j][1];
+	distance_buffer[2] = T1->pos[i][2] - T1->pos[j][2];
+	distance_buffer[3] = 0.0f;
+
+	__m128 v_1 = _mm_load_ps(distance_buffer);
+	__m128 prod = _mm_mul_ps(v_1, v_1);
+	prod = _mm_hadd_ps(prod, prod);
+	prod = _mm_hadd_ps(prod, prod);
+
+	__m128 inv_sqrt_dist = _mm_rsqrt_ss(prod);
+	__m128 inv_dist      = _mm_mul_ps(inv_sqrt_dist, inv_sqrt_dist);
+	__m128 inv_dist_cube = _mm_mul_ps(inv_dist     , inv_sqrt_dist);
+	
+	_mm_store_ps(distance_buffer, inv_dist_cube);
+#else
+	/************************** Non-SSE Code ***********************/
 	for(int k = 0; k < dim; ++k){
 	  dist += pow(T1->pos[i][k] - T1->pos[j][k], 2);
 	}
 	dist = sqrt(dist);
+	/***************************************************************/
+#endif
 	for(int k = 0; k < dim; ++k){
+#ifdef SSE
+	  T1->F[i][k] += - (T1->pos[i][k] - T1->pos[j][k])*distance_buffer[0];
+#else
 	  T1->F[i][k] += - (T1->pos[i][k] - T1->pos[j][k])/pow(dist, 3);
+#endif	  
 	}
       }
     }
+#ifdef SSE
+    /************************** SSE code ***************************/
+    //unroll the loop
+    T1->acc[i][0] = T1->F[i][0];
+    T1->acc[i][1] = T1->F[i][1];
+    T1->acc[i][2] = T1->F[i][2];
+    
+    position_buffer[0] = T1->pos[i][0];
+    position_buffer[1] = T1->pos[i][1];
+    position_buffer[2] = T1->pos[i][2];
+    position_buffer[3] = 0.0f;
+
+    velocity_buffer[0] = T1->vel[i][0];
+    velocity_buffer[1] = T1->vel[i][1];
+    velocity_buffer[2] = T1->vel[i][2];
+    velocity_buffer[3] = 0.0f;
+
+    accel_buffer[0] = T1->acc[i][0];
+    accel_buffer[1] = T1->acc[i][1];
+    accel_buffer[2] = T1->acc[i][2];
+    accel_buffer[3] = 0.0f;
+
+    __m128 v_pos    = _mm_load_ps(position_buffer);
+    __m128 v_vel    = _mm_load_ps(velocity_buffer);
+    __m128 v_acc    = _mm_load_ps(accel_buffer);
+    __m128 v_dt     = _mm_load1_ps(&dt);
+    __m128 v_dt_sq  = _mm_load1_ps(&dt_square);
+    __m128 v_hf     = _mm_load1_ps(&hf);
+    
+    __m128 v_temp_pos2 = _mm_add_ps(v_pos, _mm_add_ps(_mm_mul_ps(v_vel, v_dt), _mm_mul_ps(v_hf, _mm_mul_ps(v_acc, v_dt_sq))));
+    _mm_store_ps(position_buffer, v_temp_pos2);
+    T2->pos[i][0] = position_buffer[0];
+    T2->pos[i][1] = position_buffer[1];
+    T2->pos[i][2] = position_buffer[2];
+    
+    __m128 v_temp_vel1 = _mm_add_ps(v_vel, _mm_mul_ps(v_hf , _mm_mul_ps(v_acc , v_dt)));
+    _mm_store_ps(velocity_buffer, v_temp_vel1);
+    T1->vel[i][0] = velocity_buffer[0];
+    T1->vel[i][1] = velocity_buffer[1];
+    T1->vel[i][2] = velocity_buffer[2];
+#else
+    /************************** Non-SSE Code ***********************/
     for(int k = 0; k < dim; ++k){
       T1->acc[i][k] = T1->F[i][k];
-      T2->pos[i][k] = T1->pos[i][k] + T1->vel[i][k]*dt + 0.5*T1->acc[i][k]*pow(dt, 2);
+      T2->pos[i][k] = T1->pos[i][k] + T1->vel[i][k]*dt + 0.5*T1->acc[i][k]*dt_square;
       T1->vel[i][k] +=  0.5*T1->acc[i][k]*dt; //This will be v(t + \delta t/2)
     }
+    /***************************************************************/
+#endif
   }  
 }
 
 void evolve_Verlet2(T_Data& currThread){
   /************** Compute now v(t + \delta t) ****************/
-  double dist = 0;
+  float dist = 0;
   int lLim   = static_cast<int>((N*currThread.t_num)/MaxThreads);
   int uLim   = static_cast<int>((N*(currThread.t_num+1))/MaxThreads);
+
+  dt_square  = dt*dt;
+
+#ifdef SSE
+  /************************** SSE code ***************************/
+  float distance_buffer[4] __attribute__ ((aligned (16)));
+  float velocity_buffer[4] __attribute__ ((aligned (16)));
+  float accel_buffer[4]    __attribute__ ((aligned (16)));
+#endif
 
   for(int i = lLim; i < uLim; ++i){//Process only one piece of the data allocated to the thread
     dist = 0;
@@ -184,42 +306,150 @@ void evolve_Verlet2(T_Data& currThread){
     for(int j = 0; j < N; ++j){//Need to consider interaction with all other particles
       if(i != j){
 	dist = 0;
+#ifdef SSE
+	/************************** SSE code ***************************/
+	//unroll loop	
+	distance_buffer[0] = T2->pos[i][0] - T2->pos[j][0];
+	distance_buffer[1] = T2->pos[i][1] - T2->pos[j][1];
+	distance_buffer[2] = T2->pos[i][2] - T2->pos[j][2];
+	distance_buffer[3] = 0.0f;
+
+	__m128 v_1 = _mm_load_ps(distance_buffer);
+	__m128 prod = _mm_mul_ps(v_1, v_1);
+
+	prod = _mm_hadd_ps(prod, prod);
+	prod = _mm_hadd_ps(prod, prod);
+
+	__m128 inv_sqrt_dist = _mm_rsqrt_ss(prod);
+	__m128 inv_dist      = _mm_mul_ps(inv_sqrt_dist, inv_sqrt_dist);
+	__m128 inv_dist_cube = _mm_mul_ps(inv_dist     , inv_sqrt_dist);
+	
+	_mm_store_ps(distance_buffer, inv_dist_cube);
+#else	
+	/************************** Non-SSE Code ***********************/
 	for(int k = 0; k < dim; ++k){
 	  dist += pow(T2->pos[i][k] - T2->pos[j][k], 2);
 	}
 	dist = sqrt(dist);
+	/***************************************************************/
+#endif
 	for(int k = 0; k < dim; ++k){
+#ifdef SSE	  
+	  T2->F[i][k] += - (T2->pos[i][k] - T2->pos[j][k])*distance_buffer[0];
+#else		  
 	  T2->F[i][k] += - (T2->pos[i][k] - T2->pos[j][k])/pow(dist, 3);
+#endif	  
 	}
       }
     }
+#ifdef SSE
+    /************************** SSE code ***************************/
+    //unroll the loop
+    T2->acc[i][0] = T2->F[i][0];
+    T2->acc[i][1] = T2->F[i][1];
+    T2->acc[i][2] = T2->F[i][2];
+    
+    velocity_buffer[0] = T1->vel[i][0];
+    velocity_buffer[1] = T1->vel[i][1];
+    velocity_buffer[2] = T1->vel[i][2];
+    velocity_buffer[3] = 0.0f;
+
+    accel_buffer[0] = T2->acc[i][0];
+    accel_buffer[1] = T2->acc[i][1];
+    accel_buffer[2] = T2->acc[i][2];
+    accel_buffer[3] = 0.0f;
+
+    __m128 v_vel    = _mm_load_ps(velocity_buffer);
+    __m128 v_acc    = _mm_load_ps(accel_buffer);
+    __m128 v_dt     = _mm_load1_ps(&dt);
+    __m128 v_hf     = _mm_load1_ps(&hf);
+    
+    __m128 v_temp_vel2 = _mm_add_ps(v_vel, _mm_mul_ps(v_hf , _mm_mul_ps(v_acc , v_dt)));
+    _mm_store_ps(velocity_buffer, v_temp_vel2);
+    T2->vel[i][0] = velocity_buffer[0];
+    T2->vel[i][1] = velocity_buffer[1];
+    T2->vel[i][2] = velocity_buffer[2];
+#else
+    /************************** Non-SSE Code ***********************/
     for(int k = 0; k < dim; ++k){
       T2->acc[i][k] = T2->F[i][k];
       T2->vel[i][k] = T1->vel[i][k] + 0.5*T2->acc[i][k]*dt;
     }
+    /***************************************************************/
+#endif
   }
 }
 
 void SumThreadEnergy(T_Data& currThread,  Coords* const T,  EnergyStr& th_E){
-  double local_KE = 0;
-  double local_PE = 0;
-  double local_E  = 0;
-  double dist = 0;
+  float local_KE = 0;
+  float local_PE = 0;
+  float local_E  = 0;
+  float dist = 0;
 
   int lLim   = static_cast<int>((N*currThread.t_num)/MaxThreads);
   int uLim   = static_cast<int>((N*(currThread.t_num+1))/MaxThreads);
 
+#ifdef SSE
+  /************************** SSE code ***************************/
+  float distance_buffer[4] __attribute__ ((aligned (16)));
+  float velocity_buffer[4] __attribute__ ((aligned (16)));
+#endif
+
   for(int i = lLim; i < uLim; ++i){//Process only one piece of the data allocated to the thread
+
+#ifdef SSE
+    /************************** SSE code ***************************/
+    velocity_buffer[0] = T->vel[i][0];
+    velocity_buffer[1] = T->vel[i][1];
+    velocity_buffer[2] = T->vel[i][2];
+    velocity_buffer[3] = 0.0f;
+
+    __m128 v_vel       = _mm_load_ps(velocity_buffer);
+    __m128 v_hf        = _mm_load1_ps(&hf);
+    __m128 v_temp_KE   = _mm_mul_ps(v_hf , _mm_mul_ps(v_vel , v_vel));
+
+    v_temp_KE          = _mm_hadd_ps(v_temp_KE, v_temp_KE);
+    v_temp_KE          = _mm_hadd_ps(v_temp_KE, v_temp_KE);
+
+    _mm_store_ps(velocity_buffer, v_temp_KE);
+    local_KE += velocity_buffer[0];
+#else
+    /************************ Non-SSE code *************************/
     for(int k = 0; k < dim; ++k){
       local_KE += 0.5*pow(T->vel[i][k], 2);
     }
+    /***************************************************************/
+#endif
+
     for(int j = i+1; j < N; ++j){//Need to consider interaction with all other particles      
       dist = 0;
+#ifdef SSE
+      /************************** SSE code ***************************/
+      //unroll loop	
+      distance_buffer[0] = T->pos[i][0] - T->pos[j][0];
+      distance_buffer[1] = T->pos[i][1] - T->pos[j][1];
+      distance_buffer[2] = T->pos[i][2] - T->pos[j][2];
+      distance_buffer[3] = 0.0f;
+      
+      __m128 v_1 = _mm_load_ps(distance_buffer);
+      __m128 prod = _mm_mul_ps(v_1, v_1);
+     
+      prod = _mm_hadd_ps(prod, prod);
+      prod = _mm_hadd_ps(prod, prod);
+      
+      __m128 inv_dist = _mm_rsqrt_ss(prod);
+      
+      _mm_store_ps(distance_buffer, inv_dist);
+      local_PE += -distance_buffer[0];   
+#else
+      /************************ Non-SSE code *************************/
       for(int k = 0; k < dim; ++k){
 	dist += pow(T->pos[i][k] - T->pos[j][k], 2);
       }
       dist = sqrt(dist);
-      local_PE += -1.0/dist;      
+      local_PE += -1.0/dist;     
+      /***************************************************************/
+#endif
     }
   }
   local_E = local_PE + local_KE;
@@ -231,10 +461,10 @@ void SumThreadEnergy(T_Data& currThread,  Coords* const T,  EnergyStr& th_E){
 
 void SumTotEnergy(EnergyStr& E_Total){
   
-  double local_KE = 0;
-  double local_PE = 0;
-  double local_E  = 0;
-  double dist = 0;
+  float local_KE = 0;
+  float local_PE = 0;
+  float local_E  = 0;
+  float dist = 0;
   
 #ifdef E_PER_THREAD
   for(unsigned int q = 0; q < MaxThreads; ++q){

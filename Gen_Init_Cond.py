@@ -3,7 +3,7 @@
 dim        = 3
 tot_points = 16
 vscale     = 4.0
-pscale     = 2.0
+pscale     = 4.0
 
 import sys
 import os

@@ -10,6 +10,9 @@
 #include <GL/glut.h>
 #include <GL/glu.h>
 
+// To decouple the program framerate from the monitor VSync use:
+// nvidia-settings --load-config-only --assign="SyncToVBlank=0"
+
 const GLint dim = 3;
 const GLint N   = 16;
 
@@ -120,7 +123,7 @@ void display(void){
   glRotatef(eye_x, 0, 1, 0);
   glRotatef(-eye_y, 0, 0, 1);
   glCallList(globalFrameNo);
-  usleep(2000); 
+  //usleep(2000); 
   glPopMatrix();
   glutSwapBuffers();
   glFlush();

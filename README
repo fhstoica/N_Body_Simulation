@@ -138,3 +138,12 @@ number of particles what is optimal: to allow any thread on
 any CPU core, or to force each thread to run on a sigle CPU.
 
 Happy hacking!
+
+Update 07-Dec-2014:
+
+The code has been updated to take advantage of the SSE instructions
+available on modern processors. The -DSSE compiler flag selects the 
+SSE code. The run time drops to a bout a half of the non-optimized 
+version. 
+The compiler flags for tuning to a specific architecture are set 
+for Athlon 64, but they can be easily changed to other architectures.
